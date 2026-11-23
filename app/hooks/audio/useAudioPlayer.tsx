@@ -647,6 +647,94 @@ export const AudioPlayerProvider = ({ children }: Props) => {
     }
   }, [handleSpotifyPlaybackStateChange, isSpotifyAuthorized, spotifyPlayer]);
 
+  // Lock screen / Control Center info for Spotify. The audio itself plays
+  // inside Spotify's cross-origin SDK iframe, which iOS labels "Spotify
+  // Embedded Player". Publishing a Media Session from the top-level page lets
+  // iOS show the track, artist and artwork (and skip buttons) when it honours
+  // it. MusicKit already manages its own session for Apple Music.
+  useEffect(() => {
+    if (
+      service !== "spotify" ||
+      typeof navigator === "undefined" ||
+      !("mediaSession" in navigator)
+    ) {
+      return;
+    }
+
+    const session = navigator.mediaSession;
+
+    if (nowPlayingItem) {
+      const artworkUrl = nowPlayingItem.artwork?.url;
+      session.metadata = new MediaMetadata({
+        title: nowPlayingItem.name ?? "",
+        artist: nowPlayingItem.artistName ?? "",
+        album: nowPlayingItem.albumName ?? "iPod",
+        artwork: artworkUrl
+          ? [{ src: artworkUrl, sizes: "640x640", type: "image/jpeg" }]
+          : [],
+      });
+    }
+
+    session.playbackState = playbackInfo.isPlaying
+      ? "playing"
+      : playbackInfo.isPaused
+        ? "paused"
+        : "none";
+  }, [
+    nowPlayingItem,
+    playbackInfo.isPaused,
+    playbackInfo.isPlaying,
+    service,
+  ]);
+
+  useEffect(() => {
+    if (
+      service !== "spotify" ||
+      !spotifyPlayer ||
+      typeof navigator === "undefined" ||
+      !("mediaSession" in navigator)
+    ) {
+      return;
+    }
+
+    const session = navigator.mediaSession;
+    const handlers: Array<[MediaSessionAction, MediaSessionActionHandler | null]> = [
+      ["play", () => void spotifyPlayer.resume()],
+      ["pause", () => void spotifyPlayer.pause()],
+      ["nexttrack", () => void spotifyPlayer.nextTrack()],
+      ["previoustrack", () => void spotifyPlayer.previousTrack()],
+      [
+        "seekto",
+        (details) => {
+          if (details.seekTime !== undefined) {
+            void spotifyPlayer.seek(details.seekTime * 1000);
+          }
+        },
+      ],
+      // Clearing these makes iOS show next/previous instead of ±10s.
+      ["seekbackward", null],
+      ["seekforward", null],
+    ];
+
+    for (const [action, handler] of handlers) {
+      try {
+        session.setActionHandler(action, handler);
+      } catch {
+        // Unsupported action on this browser
+      }
+    }
+
+    return () => {
+      for (const [action] of handlers) {
+        try {
+          session.setActionHandler(action, null);
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, [service, spotifyPlayer]);
+
   // Initialize volume when either service is authorized
   useEffect(() => {
     if (isAppleAuthorized || isSpotifyAuthorized) {
