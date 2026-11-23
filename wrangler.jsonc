@@ -24,7 +24,12 @@
 		// see https://opennext.js.org/cloudflare/howtos/image
 		"binding": "IMAGES"
 	},
-	// Keep variables set in the Cloudflare dashboard (e.g. SITE_URL) across deploys.
+	"vars": {
+		// Public host of this deployment (no protocol, no /ipod). Used to build
+		// the Spotify redirect URI: https://<SITE_URL>/ipod
+		"SITE_URL": "ipod-classic.marvainstein.workers.dev"
+	},
+	// Keep variables set in the Cloudflare dashboard across deploys.
 	// Secrets (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, APPLE_DEVELOPER_TOKEN) are
 	// set as Worker secrets in the dashboard; getSecret() reads them as strings.
 	"keep_vars": true
