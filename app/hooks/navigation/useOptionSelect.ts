@@ -53,7 +53,26 @@ const useOptionSelect = ({ id, options, index }: UseOptionSelectOptions) => {
         if (isSameSong && id !== "coverFlow") {
           showView("nowPlaying");
         } else if (!isSameSong) {
-          await play(option.queueOptions);
+          try {
+            await play(option.queueOptions);
+          } catch (error) {
+            // Previously this rejection was unhandled, so a failed play just
+            // looked like the app "froze". Tell the user so they can retry.
+            console.error("[play] Unable to start playback:", error);
+            showPopup({
+              title: "Couldn't play song",
+              description:
+                "The player lost its connection. Select the song again to retry.",
+              listOptions: [
+                {
+                  type: "action",
+                  label: "Okay",
+                  onSelect: () => {},
+                },
+              ],
+            });
+            break;
+          }
 
           if (option.showNowPlayingView) {
             showView("nowPlaying");

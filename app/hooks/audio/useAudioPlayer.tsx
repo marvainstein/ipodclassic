@@ -3,12 +3,13 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
 import { useEventListener, useMKEventListener, useHapticFeedback } from "@/hooks";
 import * as ConversionUtils from "@/utils/conversion";
-import { spotifyApi } from "@/utils/spotifyApi";
+import { spotifyApi, SpotifyApiError } from "@/utils/spotifyApi";
 
 import {
   useMusicKit,
@@ -50,6 +51,22 @@ interface AudioPlayerState {
   reset: () => void;
 }
 
+/**
+ * Spotify SDK calls (nextTrack, getCurrentState, activateElement…) resolve via
+ * postMessage from the SDK's iframe. If that iframe was suspended by iOS the
+ * promise may never settle, so we never wait on them forever.
+ */
+const withTimeout = <T,>(promise: Promise<T>, ms: number): Promise<T | undefined> =>
+  Promise.race([
+    promise,
+    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ms)),
+  ]);
+
+/** Spotify answers these when the target device is gone or not ready yet. */
+const isDeviceUnavailableError = (error: unknown) =>
+  error instanceof SpotifyApiError &&
+  (error.status === 404 || error.status === 502 || error.status === 503);
+
 // Context initialized with empty object - actual value provided by AudioPlayerProvider
 export const AudioPlayerContext = createContext<AudioPlayerState>(
   {} as AudioPlayerState
@@ -77,13 +94,25 @@ export const AudioPlayerProvider = ({ children }: Props) => {
     setShuffleMode: updateShuffleModeSetting,
     setRepeatMode: updateRepeatModeSetting,
   } = useSettings();
-  const { spotifyPlayer, accessToken, deviceId, refreshAccessToken } = useSpotifySDK();
+  const {
+    spotifyPlayer,
+    accessToken,
+    deviceId,
+    refreshAccessToken,
+    getFreshAccessToken,
+    ensureDeviceReady,
+  } = useSpotifySDK();
   const { music } = useMusicKit();
   const [volume, setVolume] = useState(0.5);
   const [nowPlayingItem, setNowPlayingItem] = useState<MediaApi.MediaItem>();
   const [playbackInfo, setPlaybackInfo] = useState(defaultPlaybackInfoState);
 
   const hasNowPlayingItem = !!nowPlayingItem;
+
+  /** Shuffle state last reported by the Spotify player. */
+  const spotifyShuffleStateRef = useRef<boolean | undefined>(undefined);
+  /** Incremented per play request so stale requests don't clear the spinner. */
+  const playRequestIdRef = useRef(0);
 
   const updateSpotifyPlayerState = useCallback(
     async (endpoint: string) => {
@@ -149,13 +178,20 @@ export const AudioPlayerProvider = ({ children }: Props) => {
       }
 
       // Safari on iOS requires a user interaction to activate the player.
+      // This must be *called* synchronously inside the click, but we must not
+      // block on it: its promise can hang if the SDK iframe was suspended.
       // This function exists in the Spotify SDK, but is not present in the types.
       if (spotifyPlayer && "activateElement" in spotifyPlayer) {
-        await (
+        const activation = (
           spotifyPlayer as Spotify.Player & {
             activateElement: () => Promise<void>;
           }
-        ).activateElement();
+        )
+          .activateElement()
+          .catch((error) => {
+            console.warn("[spotify] activateElement failed:", error);
+          });
+        await withTimeout(activation, 1000);
       }
 
       // Spotify only accepts a list of song URIs, so we'll look through each media type provided for songs.
@@ -165,6 +201,8 @@ export const AudioPlayerProvider = ({ children }: Props) => {
         ...(queueOptions.songs?.map((song) => song.url) ?? []),
         queueOptions.song?.url,
       ].filter((uri): uri is string => !!uri);
+
+      const requestId = ++playRequestIdRef.current;
 
       setPlaybackInfo((prevState) => ({
         ...prevState,
@@ -180,43 +218,81 @@ export const AudioPlayerProvider = ({ children }: Props) => {
           body.offset = { position: queueOptions.startPosition };
         }
 
-        const playRequest = spotifyApi({
-          endpoint: `me/player/play`,
-          method: "PUT",
-          params: { device_id: deviceId },
-          body,
-          accessToken: accessToken!,
-          onTokenExpired: refreshAccessToken,
-        });
-
-        // Best-effort shuffle runs in parallel with play to avoid delaying track start
-        const shuffleRequest = (async () => {
-          const shouldShuffle = shuffleMode !== "off";
-          try {
-            await updateSpotifyPlayerState(
-              `shuffle?state=${shouldShuffle}&device_id=${deviceId}`
-            );
-          } catch {
-            // Shuffle is best-effort; don't block playback
+        const sendPlay = async (targetDeviceId: string | undefined) => {
+          const token = (await getFreshAccessToken()) ?? accessToken;
+          if (!token) {
+            throw new Error("Unable to play: missing Spotify access token");
           }
-        })();
+          if (!targetDeviceId) {
+            throw new Error("Unable to play: Spotify player is not connected");
+          }
 
-        await Promise.all([playRequest, shuffleRequest]);
+          await spotifyApi({
+            endpoint: `me/player/play`,
+            method: "PUT",
+            params: { device_id: targetDeviceId },
+            body,
+            accessToken: token,
+            onTokenExpired: refreshAccessToken,
+          });
+
+          return { token, targetDeviceId };
+        };
+
+        // The device can silently go offline while the app is in the
+        // background. Make sure it's registered before sending playback.
+        let result: { token: string; targetDeviceId: string };
+        try {
+          result = await sendPlay((await ensureDeviceReady()) ?? deviceId);
+        } catch (error) {
+          if (!isDeviceUnavailableError(error)) throw error;
+
+          // "Device not found": Spotify dropped our device. Reconnect and retry once.
+          console.warn("[spotify] Device unavailable, reconnecting…", error);
+          result = await sendPlay(await ensureDeviceReady({ force: true }));
+        }
+
+        // Only change shuffle *after* the new queue is playing, and only if
+        // it actually differs. Toggling it concurrently with `play` makes
+        // Spotify reshuffle the queue mid-load, which can cut off or switch
+        // the track that just started.
+        const shouldShuffle = shuffleMode !== "off";
+        if (spotifyShuffleStateRef.current !== shouldShuffle) {
+          try {
+            await spotifyApi({
+              endpoint: `me/player/shuffle`,
+              method: "PUT",
+              params: {
+                state: shouldShuffle,
+                device_id: result.targetDeviceId,
+              },
+              accessToken: result.token,
+              onTokenExpired: refreshAccessToken,
+            });
+            spotifyShuffleStateRef.current = shouldShuffle;
+          } catch (error) {
+            // Shuffle is best-effort; don't fail playback
+            console.warn("[spotify] Unable to set shuffle:", error);
+          }
+        }
       } finally {
-        setPlaybackInfo((prevState) => ({
-          ...prevState,
-          isLoading: false,
-        }));
+        if (requestId === playRequestIdRef.current) {
+          setPlaybackInfo((prevState) => ({
+            ...prevState,
+            isLoading: false,
+          }));
+        }
       }
     },
     [
       accessToken,
       deviceId,
+      ensureDeviceReady,
+      getFreshAccessToken,
       isSpotifyAuthorized,
       refreshAccessToken,
       shuffleMode,
       spotifyPlayer,
-      updateSpotifyPlayerState,
     ]
   );
 
@@ -286,7 +362,9 @@ export const AudioPlayerProvider = ({ children }: Props) => {
           }
           break;
         case "spotify":
-          await spotifyPlayer?.nextTrack();
+          if (spotifyPlayer) {
+            await withTimeout(spotifyPlayer.nextTrack(), 5000);
+          }
           break;
         default:
           throw new Error("Unable to skip next: no service specified");
@@ -317,7 +395,9 @@ export const AudioPlayerProvider = ({ children }: Props) => {
           }
           break;
         case "spotify":
-          await spotifyPlayer?.previousTrack();
+          if (spotifyPlayer) {
+            await withTimeout(spotifyPlayer.previousTrack(), 5000);
+          }
           break;
         default:
           throw new Error("Unable to skip previous: no service specified");
@@ -336,7 +416,9 @@ export const AudioPlayerProvider = ({ children }: Props) => {
     if (service === "apple" && music.nowPlayingItem) {
       mediaItem = ConversionUtils.convertAppleMediaItem(music.nowPlayingItem);
     } else if (service === "spotify") {
-      const state = await spotifyPlayer?.getCurrentState();
+      const state = spotifyPlayer
+        ? await withTimeout(spotifyPlayer.getCurrentState(), 3000)
+        : undefined;
 
       if (state) {
         mediaItem = ConversionUtils.convertSpotifyMediaItem(state);
@@ -384,6 +466,8 @@ export const AudioPlayerProvider = ({ children }: Props) => {
         return;
       }
 
+      spotifyShuffleStateRef.current = state.shuffle;
+
       setPlaybackInfo((prevState) => ({
         ...prevState,
         isPlaying: !state.paused,
@@ -407,7 +491,9 @@ export const AudioPlayerProvider = ({ children }: Props) => {
       }));
     } else if (service === "spotify") {
       const { position, duration } =
-        (await spotifyPlayer?.getCurrentState()) ?? {};
+        (spotifyPlayer
+          ? await withTimeout(spotifyPlayer.getCurrentState(), 3000)
+          : undefined) ?? {};
       const currentTime = (position ?? 0) / 1000;
       const maxTime = (duration ?? 0) / 1000;
       const timeRemaining = maxTime - currentTime;
@@ -482,6 +568,7 @@ export const AudioPlayerProvider = ({ children }: Props) => {
         await updateSpotifyPlayerState(
           `shuffle?state=${enabled}&device_id=${deviceId}`
         );
+        spotifyShuffleStateRef.current = enabled;
       }
     },
     [

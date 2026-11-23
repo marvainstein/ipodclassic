@@ -24,6 +24,15 @@ const serwist = new Serwist({
       handler: new NetworkOnly(),
     },
     {
+      // Never cache Spotify Web API / auth responses. The default
+      // "cross-origin" rule would serve them NetworkFirst with a 10s timeout
+      // from a shared cache that ignores the Authorization header.
+      matcher: ({ url }) =>
+        url.hostname === "api.spotify.com" ||
+        url.hostname === "accounts.spotify.com",
+      handler: new NetworkOnly(),
+    },
+    {
       matcher: ({ url }) =>
         url.hostname === "sdk.scdn.co" ||
         url.hostname === "js-cdn.music.apple.com",

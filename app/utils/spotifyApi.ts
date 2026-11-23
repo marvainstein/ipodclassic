@@ -21,13 +21,23 @@ type SpotifyApiOptions = {
   params?: Record<string, any>;
   body?: object;
   onTokenExpired?: () => Promise<string | undefined>;
+  /** Abort the request if Spotify hasn't answered within this many ms. */
+  timeoutMs?: number;
 };
+
+/**
+ * Requests without a timeout can hang indefinitely on iOS after the app comes
+ * back from the background (dead sockets, network handoff). That leaves the
+ * UI stuck in a loading state, so every request gets a deadline.
+ */
+const DEFAULT_TIMEOUT_MS = 15000;
 
 async function executeRequest<T>(
   url: string,
   accessToken: string,
   method: string,
-  body?: object
+  body: object | undefined,
+  timeoutMs: number
 ): Promise<T> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
@@ -37,11 +47,29 @@ async function executeRequest<T>(
     headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new SpotifyApiError(
+        408,
+        `Spotify API request timed out after ${timeoutMs}ms`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
@@ -74,6 +102,7 @@ export async function spotifyApi<T extends object = object>(
     params = {},
     body,
     onTokenExpired,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
   } = options;
 
   const queryParams = querystring.stringify(params);
@@ -82,7 +111,7 @@ export async function spotifyApi<T extends object = object>(
     : `${SPOTIFY_API_BASE}/${endpoint}`;
 
   try {
-    return await executeRequest<T>(url, accessToken, method, body);
+    return await executeRequest<T>(url, accessToken, method, body, timeoutMs);
   } catch (error) {
     if (
       error instanceof SpotifyApiError &&
@@ -91,7 +120,7 @@ export async function spotifyApi<T extends object = object>(
     ) {
       const newToken = await onTokenExpired();
       if (newToken) {
-        return await executeRequest<T>(url, newToken, method, body);
+        return await executeRequest<T>(url, newToken, method, body, timeoutMs);
       }
     }
     throw error;

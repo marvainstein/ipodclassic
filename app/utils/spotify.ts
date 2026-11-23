@@ -27,6 +27,7 @@ export const getRefreshedSpotifyTokens = async (): Promise<TokenResponse> => {
     const response = await fetch(`${API_URL}/spotify/refresh`, {
       cache: "no-store",
       credentials: "same-origin",
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!response.ok) {
