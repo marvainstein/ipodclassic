@@ -59,10 +59,13 @@ const useOptionSelect = ({ id, options, index }: UseOptionSelectOptions) => {
             // Previously this rejection was unhandled, so a failed play just
             // looked like the app "froze". Tell the user so they can retry.
             console.error("[play] Unable to start playback:", error);
+            // Include the underlying reason: on iOS home-screen apps there is
+            // no console, so this is the only way to see why playback failed.
+            const reason =
+              error instanceof Error ? error.message : String(error);
             showPopup({
               title: "Couldn't play song",
-              description:
-                "The player lost its connection. Select the song again to retry.",
+              description: `${reason.slice(0, 160)}. Select the song again to retry.`,
               listOptions: [
                 {
                   type: "action",
